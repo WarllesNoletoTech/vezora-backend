@@ -14,3 +14,10 @@ test('adicional proporcional sem ampliar vencimento',()=>{
  assert.equal(proratedProfessionalCents(1500,end,end,start),0);
  assert.equal(proratedProfessionalCents(1500,new Date('2026-11-30T23:00:00Z'),end,start),0);
 });
+
+test('renovacao antecipada considera dois ciclos restantes',()=>{
+ const now=new Date('2026-11-01T00:00:00Z');
+ const nextEnd=new Date('2026-12-31T00:00:00Z');
+ const currentCycleStart=new Date('2026-12-01T00:00:00Z');
+ assert.equal(proratedProfessionalCents(1500,now,nextEnd,currentCycleStart),3000);
+});
