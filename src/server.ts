@@ -18,11 +18,13 @@ import { reconcileMarketplaceWebhook, recoverMarketplaceBooking } from './market
 import {splitPayerName,validDeviceId} from './paymentDetails';
 import { themeFor } from './business';
 import { billingState, hasAccess, generatePix, reconcileSubscription, verifyBillingWebhook, platformSettings } from './billing';
+import {priceForSlots,proratedProfessionalCents} from './teamPricing';
+import {accessPeriod} from './trial';
 import adminRouter from './admin';
 import {financialRoutes} from './financeRoutes';
 import {commissionFor} from './finance';
 import {notifyBooking,sendOwnerPush,pushConfigured} from './notifications';
-import {startCardSubscription,cardSubscriptionStatus,cancelCardSubscription,reconcileCardInvoice,updateCardSubscriptionFromProvider} from './cardSubscriptions';
+import {startCardSubscription,cardSubscriptionStatus,cancelCardSubscription,reconcileCardInvoice,updateCardSubscriptionFromProvider,synchronizeCardMonthlyAmount} from './cardSubscriptions';
 import {MAX_MEDIA_BYTES,saveTenantMedia,findTenantMedia,mediaUrl,extractMediaId,deleteTenantMedia,type MediaKind} from './media';
 
 const app = express();
@@ -85,7 +87,7 @@ const accountData = z.object({name,phone,email:z.string().trim().toLowerCase().e
 
 app.get('/',(_req,res)=>res.json({name:'Vezora API',status:'online',health:'/api/health'}));
 app.get('/api/health',(_req,res)=>{res.setHeader('Cache-Control','no-store');res.json({status:'ok',name:'Vezora API',version:'1.0.9'});});
-app.get('/api/platform/public-settings',wrap(async(_req,res)=>{const s=await platformSettings();res.json({trialDays:s.trialDays});}));
+app.get('/api/platform/public-settings',wrap(async(_req,res)=>{const s=await platformSettings();res.setHeader('Cache-Control','public,max-age=60');res.json({trialDays:s.trialDays,monthlyPriceCents:s.monthlyPriceCents,firstMonthPriceCents:s.firstMonthPriceCents,additionalProfessionalCents:s.additionalProfessionalCents,includedProfessionals:1});}));
 app.post('/api/auth/register',wrap(async(req,res)=>{
   const body=accountData.extend({business:name,slug,businessType:businessTypeSchema}).strict().parse(req.body);
   // Confere emails legados com grafias diferentes; o indice unico impede corridas.
@@ -244,14 +246,40 @@ const proInput=proFields.superRefine((v,ctx)=>{
 });
 const proPatch=proFields.partial().strict();
 app.get('/api/professionals',auth,subscriptionGuard,wrap(async(req,res)=>{const t=await myTenant(req);res.json(await db.professional.findMany({where:{tenantId:t.id},orderBy:{name:'asc'}}));}));
-app.post('/api/professionals',auth,subscriptionGuard,wrap(async(req,res)=>{const t=await myTenant(req);const v=proInput.parse(req.body);res.status(201).json(await db.professional.create({data:{...v,tenantId:t.id}}));}));
+app.post('/api/professionals',auth,subscriptionGuard,wrap(async(req,res)=>{
+  const t=await myTenant(req),v=proInput.parse(req.body),settings=await platformSettings();
+  const created=await db.$transaction(async tx=>{
+    const fresh=await tx.tenant.findUniqueOrThrow({where:{id:t.id}});
+    const activeCount=await tx.professional.count({where:{tenantId:t.id,active:true}});
+    const seats=Math.max(1,activeCount,fresh.paidProfessionalSlots??activeCount);
+    const needsPayment=v.active && accessPeriod(fresh).status==='ACTIVE' && settings.additionalProfessionalCents>0 && activeCount>=seats;
+    // Escrever no mesmo documento serializa cadastros paralelos com o mesmo saldo de vagas.
+    await tx.tenant.update({where:{id:t.id},data:{billingRevision:{increment:1},
+      ...(fresh.paidProfessionalSlots===null&&accessPeriod(fresh).status==='ACTIVE'?{paidProfessionalSlots:seats}:{})}});
+    return tx.professional.create({data:{...v,tenantId:t.id,active:needsPayment?false:v.active,billingPending:needsPayment}});
+  });
+  res.status(201).json(created);
+}));
 app.patch('/api/professionals/:id',auth,subscriptionGuard,wrap(async(req,res)=>{
   const t=await myTenant(req);
-  const pro=await db.professional.findFirst({where:{id:String(req.params.id),tenantId:t.id}});
-  if(!pro) fail(404,'Profissional não encontrado');
   const changes=proPatch.parse(req.body);
-  const v=proInput.parse({...pro,...changes});
-  res.json(await db.professional.update({where:{id:pro!.id},data:v}));
+  const settings=await platformSettings();
+  const updated=await db.$transaction(async tx=>{
+    const [fresh,pro]=await Promise.all([
+      tx.tenant.findUniqueOrThrow({where:{id:t.id}}),
+      tx.professional.findFirst({where:{id:String(req.params.id),tenantId:t.id}})
+    ]);
+    if(!pro)fail(404,'Profissional não encontrado');
+    const v=proInput.parse({...pro,...changes});
+    if(pro.billingPending&&v.active)fail(409,'Pague o adicional em Minha assinatura antes de ativar este profissional.');
+    const activeCount=await tx.professional.count({where:{tenantId:t.id,active:true}});
+    const paidSlots=Math.max(1,activeCount,fresh.paidProfessionalSlots??activeCount);
+    const needsPayment=!pro.active&&!pro.billingPending&&v.active&&accessPeriod(fresh).status==='ACTIVE'&&settings.additionalProfessionalCents>0&&activeCount>=paidSlots;
+    await tx.tenant.update({where:{id:t.id},data:{billingRevision:{increment:1},
+      ...(fresh.paidProfessionalSlots===null&&accessPeriod(fresh).status==='ACTIVE'?{paidProfessionalSlots:paidSlots}:{})}});
+    return tx.professional.update({where:{id:pro.id},data:{...v,...(needsPayment?{active:false,billingPending:true}:{})}});
+  });
+  res.json(updated);
 }));
 // Teste opcional e autenticado de entrega OneSignal. Não envia a outros lojistas.
 app.post('/api/notifications/test',auth,subscriptionGuard,rateLimit({windowMs:15*60_000,limit:3,standardHeaders:'draft-7',legacyHeaders:false}),wrap(async(req,res)=>{
@@ -417,11 +445,21 @@ app.post('/api/booking-status/:id/reconcile',reconcileLimiter,wrap(async(req,res
 // Assinatura da PLATAFORMA: não utiliza o token OAuth individual do lojista.
 app.get('/api/billing/status',auth,wrap(async(req,res)=>{
   const t=await myTenant(req);
-  const [latest,settings]=await Promise.all([
+  const [latest,settings,activeCount,pendingCount,paidBase]=await Promise.all([
     db.subscriptionPayment.findFirst({where:{tenantId:t.id},orderBy:{createdAt:'desc'},select:{id:true,status:true,createdAt:true,expiresAt:true}}),
-    platformSettings()
+    platformSettings(),
+    db.professional.count({where:{tenantId:t.id,active:true}}),
+    db.professional.count({where:{tenantId:t.id,billingPending:true}}),
+    db.subscriptionPayment.findFirst({where:{tenantId:t.id,status:'PAID'},select:{id:true}})
   ]);
-  res.json({...billingState(t,settings.monthlyPriceCents),latestPayment:latest});
+  const slots=Math.max(1,activeCount+pendingCount);
+  const intro=!paidBase,firstPrice=priceForSlots(settings,slots,true),renewal=priceForSlots(settings,slots,false);
+  res.json({...billingState(t,renewal.totalCents),latestPayment:latest,
+    firstMonthPriceCents:firstPrice.totalCents,renewalPriceCents:renewal.totalCents,
+    nextPaymentCents:intro?firstPrice.totalCents:renewal.totalCents,isFirstMonth:intro,
+    additionalProfessionalCents:settings.additionalProfessionalCents,includedProfessionals:1,
+    professionalCount:activeCount,pendingProfessionalCount:pendingCount,paidProfessionalSlots:Math.max(1,t.paidProfessionalSlots??activeCount,activeCount)});
+
 }));
 app.post('/api/billing/pix',auth,wrap(async(req,res)=>{
   const tenant=await myTenant(req);
@@ -432,19 +470,29 @@ app.post('/api/billing/pix',auth,wrap(async(req,res)=>{
   if(tenant.suspendedAt)fail(403,'Este estabelecimento está suspenso. Contate o administrador.');
   const settings=await platformSettings();
   if(!env.VEZORA_MP_ACCESS_TOKEN||!env.VEZORA_MP_WEBHOOK_SECRET||!env.API_PUBLIC_URL||settings.monthlyPriceCents<100) fail(503,'Pagamento Pix ou mensalidade ainda não configurados pelo administrador do Vezora');
+  const [paidBase,activeCount,pendingCount]=await Promise.all([
+    db.subscriptionPayment.findFirst({where:{tenantId:tenant.id,status:'PAID'},select:{id:true}}),
+    db.professional.count({where:{tenantId:tenant.id,active:true}}),
+    db.professional.count({where:{tenantId:tenant.id,billingPending:true}})
+  ]);
+  if(pendingCount>0&&accessPeriod(tenant).status==='ACTIVE')fail(409,'Conclua primeiro o pagamento dos profissionais adicionais pendentes.');
+  const slots=Math.max(1,activeCount+pendingCount);
+  const price=priceForSlots(settings,slots,!paidBase).totalCents;
+  if(price<100)fail(503,'Preço do plano inválido para Pix. Corrija as configurações comerciais.');
+
   const activeCard=await db.cardSubscription.findUnique({where:{tenantId:tenant.id},select:{status:true}});
   if(activeCard&&['PENDING','AUTHORIZED','PAUSED','CREATING'].includes(activeCard.status))fail(409,'Existe uma autorização de cartão. Cancele a renovação antes de gerar Pix para evitar cobrança duplicada.');
   const user=await db.user.findUnique({where:{id:req.userId}});
   if(!user) fail(401,'Sessão inválida');
   // A cobrança guarda o valor escolhido pelo admin no momento da emissão;
   // uma alteração posterior nao muda os valores de uma cobrança já emitida.
-  let invoice=await db.subscriptionPayment.findFirst({where:{tenantId:tenant.id,status:'PENDING',amountCents:settings.monthlyPriceCents,expiresAt:{gt:new Date(Date.now()+60000)}},orderBy:{createdAt:'desc'}});
+  let invoice=await db.subscriptionPayment.findFirst({where:{tenantId:tenant.id,status:'PENDING',amountCents:price,billedSlots:slots,kind:'BASE',expiresAt:{gt:new Date(Date.now()+60000)}},orderBy:{createdAt:'desc'}});
   // Rascunhos legados podem estar perto de vencer; não solicitar um Pix ao provedor
   // com validade abaixo do mínimo de 30 minutos documentado pelo Mercado Pago.
   if(invoice && (!invoice.mpPaymentId || !invoice.qrCode) && invoice.expiresAt.getTime()-Date.now()<31*60000){
     invoice=null;
   }
-  if(!invoice)invoice=await db.subscriptionPayment.create({data:{tenantId:tenant.id,amountCents:settings.monthlyPriceCents,expiresAt:new Date(Date.now()+45*60000)}});
+  if(!invoice)invoice=await db.subscriptionPayment.create({data:{tenantId:tenant.id,amountCents:price,kind:'BASE',billedSlots:slots,expiresAt:new Date(Date.now()+45*60000)}});
   if(!invoice.mpPaymentId||!invoice.qrCode){
     const payment=await generatePix(invoice.id,user!.email,invoice.amountCents,data.document,invoice.expiresAt,user!.name,validDeviceId(data.deviceId)?data.deviceId:undefined);
     const tx=payment.point_of_interaction?.transaction_data;
@@ -452,6 +500,80 @@ app.post('/api/billing/pix',auth,wrap(async(req,res)=>{
     invoice=await db.subscriptionPayment.update({where:{id:invoice.id},data:{mpPaymentId:String(payment.id),qrCode:tx.qr_code,qrCodeBase64:tx.qr_code_base64||'',ticketUrl:tx.ticket_url||''}});
   }
   res.json({invoiceId:invoice.id,amountCents:invoice.amountCents,qrCode:invoice.qrCode,qrCodeBase64:invoice.qrCodeBase64,ticketUrl:invoice.ticketUrl,expiresAt:invoice.expiresAt});
+}));
+
+/** O lojista paga somente os dias restantes para ativar uma vaga nova.
+ * Cobrança Pix pela conta da plataforma; jamais usa o Mercado Pago da cliente.
+ */
+app.get('/api/billing/addons',auth,wrap(async(req,res)=>{
+ const t=await myTenant(req),settings=await platformSettings();
+ const [pros,activeCount]=await Promise.all([
+   db.professional.findMany({where:{tenantId:t.id,billingPending:true},select:{id:true,name:true,role:true},orderBy:{name:'asc'}}),
+   db.professional.count({where:{tenantId:t.id,active:true}})
+ ]);
+ const now=new Date(),until=t.subscriptionEndsAt??now;
+ const proratedCents=proratedProfessionalCents(settings.additionalProfessionalCents,now,until,t.billingCycleStartedAt);
+ res.setHeader('Cache-Control','private,no-store');
+ res.json({pending:pros,proratedCents,subscriptionEndsAt:t.subscriptionEndsAt,
+  paidProfessionalSlots:Math.max(1,t.paidProfessionalSlots??activeCount,activeCount),
+  additionalProfessionalCents:settings.additionalProfessionalCents});
+}));
+app.post('/api/billing/addons/:id/pix',auth,wrap(async(req,res)=>{
+ const t=await myTenant(req);
+ const body=z.object({
+   document:z.string().transform(x=>x.replace(/\D/g,'')).refine(x=>x.length===11||x.length===14,'Informe CPF ou CNPJ válido'),
+   deviceId:z.preprocess(v=>validDeviceId(v)?v:undefined,z.string().optional())
+ }).strict().parse(req.body);
+ if(t.suspendedAt||accessPeriod(t).status!=='ACTIVE'||!t.subscriptionEndsAt)
+   fail(409,'É necessário ter uma assinatura ativa para adicionar profissionais com cobrança proporcional.');
+ const [pro,user,settings,activeCount,card]=await Promise.all([
+   db.professional.findFirst({where:{id:String(req.params.id),tenantId:t.id,billingPending:true}}),
+   db.user.findUnique({where:{id:req.userId}}),
+   platformSettings(),db.professional.count({where:{tenantId:t.id,active:true}}),
+   db.cardSubscription.findUnique({where:{tenantId:t.id},select:{status:true}})
+ ]);
+ if(!pro)fail(404,'Profissional não encontrado ou já ativado.');
+ if(!user||!/^[0-9]{10,13}$/.test(user.phone||''))fail(428,'Informe WhatsApp no cadastro.');
+ if(card&&['CREATING','PENDING','PAUSED'].includes(card.status))
+   fail(409,'A assinatura de cartão ainda não está autorizada. Finalize ou cancele antes de pagar um adicional.');
+ const currentSlots=Math.max(1,t.paidProfessionalSlots??activeCount,activeCount);
+ const now=new Date(),due=proratedProfessionalCents(settings.additionalProfessionalCents,now,t.subscriptionEndsAt,t.billingCycleStartedAt);
+ if(due===0){
+   if(card?.status==='AUTHORIZED')fail(409,'O adicional proporcional ficou abaixo de R$ 1,00. Para evitar alterar a recorrência sem cobrança, aguarde a próxima renovação para ativar esta vaga.');
+   await synchronizeCardMonthlyAmount(t.id,priceForSlots(settings,currentSlots+1).totalCents);
+   await db.$transaction(async tx=>{
+     const p=await tx.professional.updateMany({where:{id:pro.id,tenantId:t.id,billingPending:true},data:{billingPending:false,active:true}});
+     if(p.count)await tx.tenant.update({where:{id:t.id},data:{paidProfessionalSlots:currentSlots+1}});
+   });
+   res.json({activated:true,amountCents:0});return;
+ }
+ if(!env.VEZORA_MP_ACCESS_TOKEN||!env.VEZORA_MP_WEBHOOK_SECRET||!env.API_PUBLIC_URL)
+   fail(503,'Pagamento Pix ainda não configurado pelo administrador do Vezora.');
+ // Uma cobrança adicional por vez impede sincronização simultânea de valores recorrentes.
+ let invoice=await db.$transaction(async tx=>{
+   // Conflito de escrita em billingRevision serializa duas tentativas concorrentes.
+   await tx.tenant.update({where:{id:t.id},data:{billingRevision:{increment:1}}});
+   const pending=await tx.subscriptionPayment.findFirst({
+     where:{tenantId:t.id,kind:'ADDON',status:'PENDING',expiresAt:{gt:new Date()}},
+     orderBy:{createdAt:'desc'}
+   });
+   if(pending){
+     if(pending.professionalId!==pro.id)fail(409,'Há outro adicional aguardando Pix. Conclua ou aguarde o vencimento antes de pagar o próximo.');
+     return pending;
+   }
+   return tx.subscriptionPayment.create({
+     data:{tenantId:t.id,professionalId:pro.id,kind:'ADDON',amountCents:due,
+       cycleEndsAt:t.subscriptionEndsAt!,expiresAt:new Date(Date.now()+45*60000)}
+   });
+ });
+ if(!invoice.mpPaymentId||!invoice.qrCode){
+   const payment=await generatePix(invoice.id,user.email,invoice.amountCents,body.document,invoice.expiresAt,user.name,validDeviceId(body.deviceId)?body.deviceId:undefined,'ADDON');
+   const tx=payment.point_of_interaction?.transaction_data;
+   if(!payment.id||!tx?.qr_code)fail(502,'Mercado Pago não retornou o Pix. Tente novamente.');
+   invoice=await db.subscriptionPayment.update({where:{id:invoice.id},data:{mpPaymentId:String(payment.id),qrCode:tx.qr_code,qrCodeBase64:tx.qr_code_base64||'',ticketUrl:tx.ticket_url||''}});
+ }
+ res.json({invoiceId:invoice.id,amountCents:invoice.amountCents,qrCode:invoice.qrCode,
+   qrCodeBase64:invoice.qrCodeBase64,ticketUrl:invoice.ticketUrl,expiresAt:invoice.expiresAt,kind:'ADDON'});
 }));
 app.post('/api/billing/check/:id',auth,wrap(async(req,res)=>{
   const t=await myTenant(req);
@@ -472,13 +594,21 @@ app.post('/api/billing/card/start',auth,wrap(async(req,res)=>{
   const t=await myTenant(req);
   if(t.suspendedAt)fail(403,'Estabelecimento suspenso.');
   if(!t.businessType)fail(428,'Complete o cadastro antes de assinar.');
+  if(t.subscriptionEndsAt&&t.subscriptionEndsAt.getTime()>Date.now()+3*86400000)
+    fail(409,'Sua assinatura já está paga. Para evitar uma nova cobrança antecipada, ative o cartão quando faltarem até 3 dias para o vencimento.');
   const owner=await db.user.findUnique({where:{id:req.userId},select:{email:true,phone:true}});
   if(!owner||!owner.phone)fail(428,'Informe WhatsApp no cadastro.');
   const s=await platformSettings();
   if(s.monthlyPriceCents<100)fail(503,'Defina a mensalidade no painel do administrador.');
+  const [activeCount,paidBase,pendingCount]=await Promise.all([db.professional.count({where:{tenantId:t.id,active:true}}),db.subscriptionPayment.findFirst({where:{tenantId:t.id,status:'PAID'},select:{id:true}}),db.professional.count({where:{tenantId:t.id,billingPending:true}})]);
+  if(pendingCount>0)fail(409,'Conclua primeiro o pagamento dos profissionais adicionais pendentes.');
+  if(!paidBase&&s.firstMonthPriceCents!==null&&s.firstMonthPriceCents!==s.monthlyPriceCents)
+    fail(409,'O preço promocional do primeiro mês está disponível via Pix. Após esse pagamento você poderá usar o cartão recorrente.');
+  const monthlyTotal=priceForSlots(s,Math.max(1,activeCount)).totalCents;
+
   const pendingPix=await db.subscriptionPayment.findFirst({where:{tenantId:t.id,status:'PENDING',expiresAt:{gt:new Date()}},select:{id:true}});
   if(pendingPix)fail(409,'Há um Pix pendente. Aguarde seu vencimento antes de cadastrar cartão.');
-  const created=await startCardSubscription(t.id,owner.email,s.monthlyPriceCents);
+  const created=await startCardSubscription(t.id,owner.email,monthlyTotal);
   res.json(created);
 }));
 app.post('/api/billing/card/cancel',auth,wrap(async(req,res)=>{

@@ -96,7 +96,8 @@ export async function reconcileCardInvoice(authorizedPaymentId:string){
    // Não acumular os 2 dias extras em cada renovação.
    const currentEnd=tenant.subscriptionEndsAt?.getTime()||0;
    const nextEnd=new Date(Math.max(currentEnd,approvedAt.getTime()+Math.max(BILLING_DAYS,32)*86400000));
-   await tx.tenant.update({where:{id:local.tenantId},data:{subscriptionEndsAt:nextEnd}});
+   const activeSlots=await tx.professional.count({where:{tenantId:local.tenantId,active:true}});
+   await tx.tenant.update({where:{id:local.tenantId},data:{subscriptionEndsAt:nextEnd,billingCycleStartedAt:new Date(nextEnd.getTime()-32*86400000),paidProfessionalSlots:Math.max(1,activeSlots)}});
    return true;
   });
  }catch(e){
@@ -126,4 +127,22 @@ export async function cancelCardSubscription(tenantId:string){
  await db.cardSubscription.update({where:{id:sub.id},data:{status:'CANCELLED'}});
  // Período já pago continua válido até vencimento; cancelar impede novas cobranças.
  return true;
+}
+
+/** Atualiza o valor das próximas cobranças do cartão APÓS autorização do provedor.
+ * Chamado antes de ativar profissional extra; se falhar, o adicional permanece pendente.
+ */
+export async function synchronizeCardMonthlyAmount(tenantId:string,expectedMonthlyCents:number){
+ const sub=await db.cardSubscription.findUnique({where:{tenantId}});
+ if(!sub||sub.status==='CANCELLED')return;
+ if(sub.status!=='AUTHORIZED'||!sub.preapprovalId)error(409,'A autorização de cartão está em andamento. Conclua ou cancele antes de adicionar profissionais.');
+ if(sub.amountCents===expectedMonthlyCents)return;
+ await requestMP<Preapproval>(`/preapproval/${encodeURIComponent(sub.preapprovalId)}`,'PUT',{
+   auto_recurring:{transaction_amount:expectedMonthlyCents/100}
+ });
+ const verified=await requestMP<Preapproval & {auto_recurring?:{transaction_amount?:number}}>(`/preapproval/${encodeURIComponent(sub.preapprovalId)}`,'GET');
+ if(Math.abs(Number(verified.auto_recurring?.transaction_amount)*100-expectedMonthlyCents)>1 ||
+    !Number.isFinite(Number(verified.auto_recurring?.transaction_amount)))
+   error(502,'Mercado Pago não confirmou o novo valor recorrente. O profissional permanece aguardando ativação.');
+ await db.cardSubscription.update({where:{id:sub.id},data:{amountCents:expectedMonthlyCents}});
 }

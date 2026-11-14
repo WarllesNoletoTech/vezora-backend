@@ -4,6 +4,8 @@ import { env } from './env';
 import { verifyMercadoPagoSignature } from './webhookSignature';
 import { accessPeriod,BILLING_DAYS } from './trial';
 import {splitPayerName,validDeviceId} from './paymentDetails';
+import {priceForSlots} from './teamPricing';
+import {synchronizeCardMonthlyAmount} from './cardSubscriptions';
 
 export async function platformSettings() {
   // O primeiro acesso cria a configuracao neutra (valor zero): nao cobra sem preco salvo.
@@ -48,15 +50,15 @@ async function mpAPI<T>(path:string,method:'GET'|'POST',body?:unknown,idempotenc
   return await result.json() as T;
 }
 export async function paymentFromProvider(id:string) {return mpAPI<MPSubscriptionPayment>(`/v1/payments/${encodeURIComponent(id)}`,'GET');}
-export async function generatePix(id:string,payerEmail:string,amountCents:number,document:string,expiresAt:Date,payerFullName='',deviceId?:string) {
+export async function generatePix(id:string,payerEmail:string,amountCents:number,document:string,expiresAt:Date,payerFullName='',deviceId?:string,kind:'BASE'|'ADDON'='BASE') {
   const payer=splitPayerName(payerFullName);
   console.info('[Vezora Assinaturas] Pix solicitado; Device ID oficial:', validDeviceId(deviceId) ? 'presente' : 'indisponível');
   return mpAPI<MPSubscriptionPayment>('/v1/payments','POST',{
     transaction_amount:amountCents/100,
-    description:'Assinatura Vezora - 30 dias',payment_method_id:'pix',
+    description:kind==='ADDON'?'Vezora - profissional adicional proporcional':'Assinatura Vezora - 30 dias',payment_method_id:'pix',
     external_reference:id,
     payer:{email:payerEmail,first_name:payer.firstName,...(payer.lastName?{last_name:payer.lastName}:{}),identification:{type:document.length===11?'CPF':'CNPJ',number:document}},
-    additional_info:{items:[{id:'vezora-mensalidade',title:'Assinatura Vezora - 30 dias',description:'Acesso mensal ao sistema de agendamentos Vezora',category_id:'services',quantity:1,unit_price:amountCents/100}]},
+    additional_info:{items:[{id:kind==='ADDON'?'vezora-adicional':'vezora-mensalidade',title:kind==='ADDON'?'Profissional adicional Vezora':'Assinatura Vezora - 30 dias',description:kind==='ADDON'?'Acesso adicional ate o fim do ciclo vigente':'Acesso mensal ao sistema de agendamentos Vezora',category_id:'services',quantity:1,unit_price:amountCents/100}]},
     notification_url:`${env.API_PUBLIC_URL}/api/billing/webhook`,
     // O Mercado Pago exige pelo menos 30 minutos no momento em que recebe a requisição.
     // Usar o vencimento local da cobrança (45 min) evita rejeição por latência de rede.
@@ -66,7 +68,7 @@ export async function generatePix(id:string,payerEmail:string,amountCents:number
 export function verifyBillingWebhook(signature:string,requestId:string,id:string) {
   return Boolean(env.VEZORA_MP_WEBHOOK_SECRET && verifyMercadoPagoSignature(signature,requestId,id,env.VEZORA_MP_WEBHOOK_SECRET));
 }
-/** Confere sempre o pagamento na API oficial; corpo de webhook e retorno do cliente não concedem acesso. */
+/** Reconciliacao idempotente: a confirmacao da API do Mercado Pago e a unica fonte de verdade. */
 export async function reconcileSubscription(paymentId:string) {
   const external=await paymentFromProvider(paymentId);
   const invoice=await db.subscriptionPayment.findUnique({where:{id:String(external.external_reference||'')}});
@@ -75,23 +77,54 @@ export async function reconcileSubscription(paymentId:string) {
      (external.currency_id && external.currency_id!=='BRL')||
      (env.VEZORA_MP_COLLECTOR_ID&&String(external.collector_id)!==env.VEZORA_MP_COLLECTOR_ID)||
      (invoice.mpPaymentId&&invoice.mpPaymentId!==String(external.id))) return false;
-  if(external.status!=='approved') return false;
+  if(external.status!=='approved'||invoice.status!=='PENDING')return false;
   const providerPaidAt=external.date_approved?new Date(external.date_approved):new Date();
-  if(!Number.isFinite(providerPaidAt.getTime())||providerPaidAt.getTime()>Date.now()+5*60000) return false;
+  if(!Number.isFinite(providerPaidAt.getTime())||providerPaidAt.getTime()>Date.now()+5*60000)return false;
+
+  if(invoice.kind==='ADDON') {
+    if(!invoice.professionalId||!invoice.cycleEndsAt)return false;
+    const tenant=await db.tenant.findUnique({where:{id:invoice.tenantId}});
+    if(!tenant||tenant.archivedAt)return false;
+    const active=await db.professional.count({where:{tenantId:tenant.id,active:true}});
+    const currentSlots=Math.max(1,tenant.paidProfessionalSlots??active,active);
+    const settings=await platformSettings();
+    const monthly=priceForSlots(settings,currentSlots+1).totalCents;
+    // Evita aceitar um profissional a mais sem atualizar a proxima cobranca recorrente.
+    await synchronizeCardMonthlyAmount(tenant.id,monthly);
+  }
+
   const tryUpdate=()=>db.$transaction(async tx=>{
     const pending=await tx.subscriptionPayment.updateMany({where:{id:invoice.id,status:'PENDING'},data:{status:'PAID',paidAt:providerPaidAt,mpPaymentId:String(external.id)}});
     if(!pending.count)return false;
     const tenant=await tx.tenant.findUnique({where:{id:invoice.tenantId}});
     if(!tenant)return false;
+    if(invoice.kind==='ADDON') {
+      if(!invoice.professionalId)return false;
+      const active=await tx.professional.count({where:{tenantId:tenant.id,active:true}});
+      const slots=Math.max(1,tenant.paidProfessionalSlots??active,active)+1;
+      await tx.tenant.update({where:{id:tenant.id},data:{paidProfessionalSlots:slots}});
+      await tx.professional.updateMany({where:{id:invoice.professionalId,tenantId:tenant.id,billingPending:true},data:{active:true}});
+      // Um adicional nao estende o vencimento da assinatura.
+      return true;
+    }
     const base=tenant.subscriptionEndsAt && tenant.subscriptionEndsAt>providerPaidAt?tenant.subscriptionEndsAt:providerPaidAt;
-    await tx.tenant.update({where:{id:tenant.id},data:{subscriptionEndsAt:new Date(base.getTime()+BILLING_DAYS*86400000)}});
+    const nextEnd=new Date(base.getTime()+BILLING_DAYS*86400000);
+    const active=await tx.professional.count({where:{tenantId:tenant.id,active:true}});
+    const slots=Math.max(1,active,invoice.billedSlots??1);
+    await tx.tenant.update({where:{id:tenant.id},data:{subscriptionEndsAt:nextEnd,billingCycleStartedAt:base,paidProfessionalSlots:slots}});
+    // O preco foi congelado na emissao do Pix. So liberar vagas previstas no valor pago.
+    const openSlots=Math.max(0,slots-active);
+    if(openSlots){
+      const pendingPros=await tx.professional.findMany({where:{tenantId:tenant.id,billingPending:true},take:openSlots,orderBy:{name:'asc'},select:{id:true}});
+      for(const p of pendingPros)await tx.professional.update({where:{id:p.id},data:{active:true}});
+    }
     return true;
   });
   for(let attempt=0;attempt<3;attempt++){
     try{return await tryUpdate();}
     catch(error){
-      const text=String((error as Error).message||'');
-      if(attempt===2||!(error instanceof Prisma.PrismaClientKnownRequestError&&error.code==='P2034')&&!/WriteConflict|TransientTransactionError/i.test(text))throw error;
+      const msg=String((error as Error).message||'');
+      if(attempt===2||!(error instanceof Prisma.PrismaClientKnownRequestError&&error.code==='P2034')&&!/WriteConflict|TransientTransactionError/i.test(msg))throw error;
     }
   }
   return false;
