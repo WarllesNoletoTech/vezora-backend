@@ -372,8 +372,8 @@ app.post('/api/public/:slug/bookings',wrap(async(req,res)=>{
   }
 }));
 app.get('/api/booking-status/:id',wrap(async(req,res)=>{
-  const b=await db.booking.findUnique({where:{id:String(req.params.id)},select:{status:true,startAt:true,depositCents:true,paymentStatus:true,checkoutUrl:true,expiresAt:true,tenant:{select:{timezone:true,slug:true,name:true}}}});
-  if(!b) fail(404,'Reserva não encontrada');
+  const b=await db.booking.findUnique({where:{id:String(req.params.id)},select:{status:true,startAt:true,depositCents:true,paymentStatus:true,checkoutUrl:true,expiresAt:true,tenant:{select:{timezone:true,slug:true,name:true,archivedAt:true}}}});
+  if(!b || b.tenant.archivedAt) fail(404,'Reserva não encontrada');
   const isExpired=b.status==='PENDING_PAYMENT'&&!!b.expiresAt&&b.expiresAt<new Date();
   res.json({...b,status:isExpired?'EXPIRED':b.status,checkoutUrl:isExpired?null:b.checkoutUrl});
 }));
@@ -382,6 +382,8 @@ app.get('/api/booking-status/:id',wrap(async(req,res)=>{
 const reconcileLimiter=rateLimit({windowMs:15*60_000,limit:6,standardHeaders:'draft-7',legacyHeaders:false});
 app.post('/api/booking-status/:id/reconcile',reconcileLimiter,wrap(async(req,res)=>{
   const id=z.string().uuid().parse(req.params.id);
+  const bookingScope=await db.booking.findUnique({where:{id},select:{tenant:{select:{archivedAt:true}}}});
+  if(!bookingScope || bookingScope.tenant.archivedAt)fail(404,'Reserva não encontrada');
   const result=await recoverMarketplaceBooking(id);
   if(result.reason==='booking_not_found') fail(404,'Reserva não encontrada');
   const booking=await db.booking.findUnique({where:{id},select:{status:true,paymentStatus:true,depositPaidAt:true}});
