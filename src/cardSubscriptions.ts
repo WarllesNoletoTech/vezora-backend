@@ -96,7 +96,8 @@ export async function reconcileCardInvoice(authorizedPaymentId:string){
    // Não acumular os 2 dias extras em cada renovação.
    const currentEnd=tenant.subscriptionEndsAt?.getTime()||0;
    const nextEnd=new Date(Math.max(currentEnd,approvedAt.getTime()+Math.max(BILLING_DAYS,32)*86400000));
-   await tx.tenant.update({where:{id:local.tenantId},data:{subscriptionEndsAt:nextEnd}});
+   const activeSlots=await tx.professional.count({where:{tenantId:local.tenantId,active:true}});
+   await tx.tenant.update({where:{id:local.tenantId},data:{subscriptionEndsAt:nextEnd,billingCycleStartedAt:new Date(nextEnd.getTime()-32*86400000),paidProfessionalSlots:Math.max(1,activeSlots)}});
    return true;
   });
  }catch(e){
