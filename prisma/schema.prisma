@@ -44,6 +44,9 @@ model Tenant {
   suspendedAt    DateTime?
   suspensionReason String?
   subscriptionEndsAt DateTime?
+  // Direitos de equipe do ciclo vigente; null preserva equipe de assinantes antigos.
+  paidProfessionalSlots Int?
+  billingCycleStartedAt DateTime?
   subscriptionPayments SubscriptionPayment[]
   cardSubscription CardSubscription?
   createdAt      DateTime       @default(now())
@@ -84,6 +87,7 @@ model Professional {
   name      String
   photoUrl  String    @default("")
   active    Boolean   @default(true)
+  billingPending Boolean @default(false) // fica invisivel para reservas ate pagar adicional
   // chaves 0..6 (domingo..sábado), valores ["09:00","18:00"] ou null
   schedule  Json
   bookings  Booking[]
@@ -222,6 +226,10 @@ model SubscriptionPayment {
   amountCents    Int
   status         String   @default("PENDING")
   paymentMethod  String   @default("PIX") // PIX ou CARD
+  kind           String   @default("BASE") // BASE ou ADDON
+  professionalId String?
+  billedSlots    Int?
+  cycleEndsAt    DateTime?
   mpPaymentId    String?
   qrCode         String   @default("")
   qrCodeBase64   String   @default("")
@@ -244,6 +252,8 @@ enum UserRole {
 model PlatformSettings {
   id                String   @id @default("global") @map("_id")
   monthlyPriceCents Int      @default(0)
+  firstMonthPriceCents Int? // null = mesmo valor das renovacoes
+  additionalProfessionalCents Int @default(0) // adicional mensal por vaga acima da primeira
   trialDays         Int      @default(3) // aplicado aos novos cadastros
   updatedAt         DateTime @updatedAt
 }
