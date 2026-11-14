@@ -19,9 +19,11 @@ export function proratedProfessionalCents(monthlyCents:number,now:Date,expiresAt
   if(!Number.isSafeInteger(monthlyCents)||monthlyCents<0)throw new Error('Adicional inválido');
   const remaining=expiresAt.getTime()-now.getTime();
   if(!Number.isFinite(remaining)||remaining<=0||monthlyCents===0)return 0;
-  const maxDuration=30*86400000;
-  const actualDuration=cycleStartAt ? expiresAt.getTime()-cycleStartAt.getTime() : maxDuration;
-  const period=Math.max(1,Math.min(Math.max(1,actualDuration),maxDuration));
-  const cents=Math.min(monthlyCents,Math.ceil(monthlyCents*Math.min(remaining,period)/period));
+  const monthMs=30*86400000;
+  // Cartao mantém até 32 dias de margem de acesso; Pix utiliza 30 dias.
+  // Se houver renovação antecipada e 2 ciclos pagos, são cobrados os 2 ciclos restantes.
+  const cycleMs=cycleStartAt?expiresAt.getTime()-cycleStartAt.getTime():monthMs;
+  const period=Math.min(32*86400000,Math.max(monthMs,cycleMs));
+  const cents=Math.ceil(monthlyCents*remaining/period);
   return cents<100?0:cents;
 }
