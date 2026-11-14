@@ -86,7 +86,7 @@ export async function reconcileSubscription(paymentId:string) {
     const tenant=await db.tenant.findUnique({where:{id:invoice.tenantId}});
     if(!tenant||tenant.archivedAt)return false;
     const active=await db.professional.count({where:{tenantId:tenant.id,active:true}});
-    const currentSlots=Math.max(1,tenant.paidProfessionalSlots??active);
+    const currentSlots=Math.max(1,tenant.paidProfessionalSlots??active,active);
     const settings=await platformSettings();
     const monthly=priceForSlots(settings,currentSlots+1).totalCents;
     // Evita aceitar um profissional a mais sem atualizar a proxima cobranca recorrente.
@@ -101,7 +101,7 @@ export async function reconcileSubscription(paymentId:string) {
     if(invoice.kind==='ADDON') {
       if(!invoice.professionalId)return false;
       const active=await tx.professional.count({where:{tenantId:tenant.id,active:true}});
-      const slots=Math.max(1,tenant.paidProfessionalSlots??active)+1;
+      const slots=Math.max(1,tenant.paidProfessionalSlots??active,active)+1;
       await tx.tenant.update({where:{id:tenant.id},data:{paidProfessionalSlots:slots}});
       await tx.professional.updateMany({where:{id:invoice.professionalId,tenantId:tenant.id,billingPending:true},data:{active:true}});
       // Um adicional nao estende o vencimento da assinatura.
