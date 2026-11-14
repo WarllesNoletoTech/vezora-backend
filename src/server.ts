@@ -18,6 +18,8 @@ import { reconcileMarketplaceWebhook, recoverMarketplaceBooking } from './market
 import {splitPayerName,validDeviceId} from './paymentDetails';
 import { themeFor } from './business';
 import { billingState, hasAccess, generatePix, reconcileSubscription, verifyBillingWebhook, platformSettings } from './billing';
+import {priceForSlots,proratedProfessionalCents} from './teamPricing';
+import {accessPeriod} from './trial';
 import adminRouter from './admin';
 import {financialRoutes} from './financeRoutes';
 import {commissionFor} from './finance';
@@ -85,7 +87,7 @@ const accountData = z.object({name,phone,email:z.string().trim().toLowerCase().e
 
 app.get('/',(_req,res)=>res.json({name:'Vezora API',status:'online',health:'/api/health'}));
 app.get('/api/health',(_req,res)=>{res.setHeader('Cache-Control','no-store');res.json({status:'ok',name:'Vezora API',version:'1.0.9'});});
-app.get('/api/platform/public-settings',wrap(async(_req,res)=>{const s=await platformSettings();res.json({trialDays:s.trialDays});}));
+app.get('/api/platform/public-settings',wrap(async(_req,res)=>{const s=await platformSettings();res.setHeader('Cache-Control','public,max-age=60');res.json({trialDays:s.trialDays,monthlyPriceCents:s.monthlyPriceCents,firstMonthPriceCents:s.firstMonthPriceCents,additionalProfessionalCents:s.additionalProfessionalCents,includedProfessionals:1});}));
 app.post('/api/auth/register',wrap(async(req,res)=>{
   const body=accountData.extend({business:name,slug,businessType:businessTypeSchema}).strict().parse(req.body);
   // Confere emails legados com grafias diferentes; o indice unico impede corridas.
@@ -244,13 +246,35 @@ const proInput=proFields.superRefine((v,ctx)=>{
 });
 const proPatch=proFields.partial().strict();
 app.get('/api/professionals',auth,subscriptionGuard,wrap(async(req,res)=>{const t=await myTenant(req);res.json(await db.professional.findMany({where:{tenantId:t.id},orderBy:{name:'asc'}}));}));
-app.post('/api/professionals',auth,subscriptionGuard,wrap(async(req,res)=>{const t=await myTenant(req);const v=proInput.parse(req.body);res.status(201).json(await db.professional.create({data:{...v,tenantId:t.id}}));}));
+app.post('/api/professionals',auth,subscriptionGuard,wrap(async(req,res)=>{
+  const t=await myTenant(req),v=proInput.parse(req.body),settings=await platformSettings();
+  const activeCount=await db.professional.count({where:{tenantId:t.id,active:true,billingPending:false}});
+  const seats=Math.max(1,t.paidProfessionalSlots??activeCount);
+  const needsPayment=v.active && accessPeriod(t).status==='ACTIVE' && settings.additionalProfessionalCents>0 && activeCount>=seats;
+  const created=await db.$transaction(async tx=>{
+    // Registra a quantidade legada antes de adicionar, para evitar cobrança retroativa.
+    if(t.paidProfessionalSlots===null && accessPeriod(t).status==='ACTIVE')
+      await tx.tenant.update({where:{id:t.id},data:{paidProfessionalSlots:seats}});
+    return tx.professional.create({data:{...v,tenantId:t.id,active:needsPayment?false:v.active,billingPending:needsPayment}});
+  });
+  res.status(201).json(created);
+}));
 app.patch('/api/professionals/:id',auth,subscriptionGuard,wrap(async(req,res)=>{
   const t=await myTenant(req);
   const pro=await db.professional.findFirst({where:{id:String(req.params.id),tenantId:t.id}});
   if(!pro) fail(404,'Profissional não encontrado');
   const changes=proPatch.parse(req.body);
   const v=proInput.parse({...pro,...changes});
+  if(pro.billingPending && v.active)fail(409,'Pague o adicional em Minha assinatura antes de ativar este profissional.');
+  if(!pro.active && !pro.billingPending && v.active){
+    const [settings,activeCount]=await Promise.all([platformSettings(),db.professional.count({where:{tenantId:t.id,active:true,billingPending:false}})]);
+    const paidSlots=Math.max(1,t.paidProfessionalSlots??activeCount);
+    const needsPayment=accessPeriod(t).status==='ACTIVE' && settings.additionalProfessionalCents>0 && activeCount>=paidSlots;
+    if(needsPayment){
+      if(t.paidProfessionalSlots===null)await db.tenant.update({where:{id:t.id},data:{paidProfessionalSlots:paidSlots}});
+      res.json(await db.professional.update({where:{id:pro!.id},data:{...v,active:false,billingPending:true}}));return;
+    }
+  }
   res.json(await db.professional.update({where:{id:pro!.id},data:v}));
 }));
 // Teste opcional e autenticado de entrega OneSignal. Não envia a outros lojistas.
