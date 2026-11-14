@@ -248,34 +248,38 @@ const proPatch=proFields.partial().strict();
 app.get('/api/professionals',auth,subscriptionGuard,wrap(async(req,res)=>{const t=await myTenant(req);res.json(await db.professional.findMany({where:{tenantId:t.id},orderBy:{name:'asc'}}));}));
 app.post('/api/professionals',auth,subscriptionGuard,wrap(async(req,res)=>{
   const t=await myTenant(req),v=proInput.parse(req.body),settings=await platformSettings();
-  const activeCount=await db.professional.count({where:{tenantId:t.id,active:true}});
-  const seats=Math.max(1,t.paidProfessionalSlots??activeCount);
-  const needsPayment=v.active && accessPeriod(t).status==='ACTIVE' && settings.additionalProfessionalCents>0 && activeCount>=seats;
   const created=await db.$transaction(async tx=>{
-    // Registra a quantidade legada antes de adicionar, para evitar cobrança retroativa.
-    if(t.paidProfessionalSlots===null && accessPeriod(t).status==='ACTIVE')
-      await tx.tenant.update({where:{id:t.id},data:{paidProfessionalSlots:seats}});
+    const fresh=await tx.tenant.findUniqueOrThrow({where:{id:t.id}});
+    const activeCount=await tx.professional.count({where:{tenantId:t.id,active:true}});
+    const seats=Math.max(1,activeCount,fresh.paidProfessionalSlots??activeCount);
+    const needsPayment=v.active && accessPeriod(fresh).status==='ACTIVE' && settings.additionalProfessionalCents>0 && activeCount>=seats;
+    // Escrever no mesmo documento serializa cadastros paralelos com o mesmo saldo de vagas.
+    await tx.tenant.update({where:{id:t.id},data:{billingRevision:{increment:1},
+      ...(fresh.paidProfessionalSlots===null&&accessPeriod(fresh).status==='ACTIVE'?{paidProfessionalSlots:seats}:{})}});
     return tx.professional.create({data:{...v,tenantId:t.id,active:needsPayment?false:v.active,billingPending:needsPayment}});
   });
   res.status(201).json(created);
 }));
 app.patch('/api/professionals/:id',auth,subscriptionGuard,wrap(async(req,res)=>{
   const t=await myTenant(req);
-  const pro=await db.professional.findFirst({where:{id:String(req.params.id),tenantId:t.id}});
-  if(!pro) fail(404,'Profissional não encontrado');
   const changes=proPatch.parse(req.body);
-  const v=proInput.parse({...pro,...changes});
-  if(pro.billingPending && v.active)fail(409,'Pague o adicional em Minha assinatura antes de ativar este profissional.');
-  if(!pro.active && !pro.billingPending && v.active){
-    const [settings,activeCount]=await Promise.all([platformSettings(),db.professional.count({where:{tenantId:t.id,active:true}})]);
-    const paidSlots=Math.max(1,t.paidProfessionalSlots??activeCount);
-    const needsPayment=accessPeriod(t).status==='ACTIVE' && settings.additionalProfessionalCents>0 && activeCount>=paidSlots;
-    if(needsPayment){
-      if(t.paidProfessionalSlots===null)await db.tenant.update({where:{id:t.id},data:{paidProfessionalSlots:paidSlots}});
-      res.json(await db.professional.update({where:{id:pro!.id},data:{...v,active:false,billingPending:true}}));return;
-    }
-  }
-  res.json(await db.professional.update({where:{id:pro!.id},data:v}));
+  const settings=await platformSettings();
+  const updated=await db.$transaction(async tx=>{
+    const [fresh,pro]=await Promise.all([
+      tx.tenant.findUniqueOrThrow({where:{id:t.id}}),
+      tx.professional.findFirst({where:{id:String(req.params.id),tenantId:t.id}})
+    ]);
+    if(!pro)fail(404,'Profissional não encontrado');
+    const v=proInput.parse({...pro,...changes});
+    if(pro.billingPending&&v.active)fail(409,'Pague o adicional em Minha assinatura antes de ativar este profissional.');
+    const activeCount=await tx.professional.count({where:{tenantId:t.id,active:true}});
+    const paidSlots=Math.max(1,activeCount,fresh.paidProfessionalSlots??activeCount);
+    const needsPayment=!pro.active&&!pro.billingPending&&v.active&&accessPeriod(fresh).status==='ACTIVE'&&settings.additionalProfessionalCents>0&&activeCount>=paidSlots;
+    await tx.tenant.update({where:{id:t.id},data:{billingRevision:{increment:1},
+      ...(fresh.paidProfessionalSlots===null&&accessPeriod(fresh).status==='ACTIVE'?{paidProfessionalSlots:paidSlots}:{})}});
+    return tx.professional.update({where:{id:pro.id},data:{...v,...(needsPayment?{active:false,billingPending:true}:{})}});
+  });
+  res.json(updated);
 }));
 // Teste opcional e autenticado de entrega OneSignal. Não envia a outros lojistas.
 app.post('/api/notifications/test',auth,subscriptionGuard,rateLimit({windowMs:15*60_000,limit:3,standardHeaders:'draft-7',legacyHeaders:false}),wrap(async(req,res)=>{
