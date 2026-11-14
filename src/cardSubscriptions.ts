@@ -140,5 +140,9 @@ export async function synchronizeCardMonthlyAmount(tenantId:string,expectedMonth
  await requestMP<Preapproval>(`/preapproval/${encodeURIComponent(sub.preapprovalId)}`,'PUT',{
    auto_recurring:{transaction_amount:expectedMonthlyCents/100}
  });
+ const verified=await requestMP<Preapproval & {auto_recurring?:{transaction_amount?:number}}>(`/preapproval/${encodeURIComponent(sub.preapprovalId)}`,'GET');
+ if(Math.abs(Number(verified.auto_recurring?.transaction_amount)*100-expectedMonthlyCents)>1 ||
+    !Number.isFinite(Number(verified.auto_recurring?.transaction_amount)))
+   error(502,'Mercado Pago não confirmou o novo valor recorrente. O profissional permanece aguardando ativação.');
  await db.cardSubscription.update({where:{id:sub.id},data:{amountCents:expectedMonthlyCents}});
 }
