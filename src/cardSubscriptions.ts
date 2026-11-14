@@ -127,3 +127,17 @@ export async function cancelCardSubscription(tenantId:string){
  // Período já pago continua válido até vencimento; cancelar impede novas cobranças.
  return true;
 }
+
+/** Atualiza o valor das próximas cobranças do cartão APÓS autorização do provedor.
+ * Chamado antes de ativar profissional extra; se falhar, o adicional permanece pendente.
+ */
+export async function synchronizeCardMonthlyAmount(tenantId:string,expectedMonthlyCents:number){
+ const sub=await db.cardSubscription.findUnique({where:{tenantId}});
+ if(!sub||sub.status==='CANCELLED')return;
+ if(sub.status!=='AUTHORIZED'||!sub.preapprovalId)error(409,'A autorização de cartão está em andamento. Conclua ou cancele antes de adicionar profissionais.');
+ if(sub.amountCents===expectedMonthlyCents)return;
+ await requestMP<Preapproval>(`/preapproval/${encodeURIComponent(sub.preapprovalId)}`,'PUT',{
+   auto_recurring:{transaction_amount:expectedMonthlyCents/100}
+ });
+ await db.cardSubscription.update({where:{id:sub.id},data:{amountCents:expectedMonthlyCents}});
+}
