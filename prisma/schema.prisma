@@ -46,6 +46,7 @@ model Tenant {
   subscriptionEndsAt DateTime?
   // Direitos de equipe do ciclo vigente; null preserva equipe de assinantes antigos.
   paidProfessionalSlots Int?
+  billingRevision Int @default(0) // escrita concorrente de vagas e cobranças
   billingCycleStartedAt DateTime?
   subscriptionPayments SubscriptionPayment[]
   cardSubscription CardSubscription?
