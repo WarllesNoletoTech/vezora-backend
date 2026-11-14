@@ -24,7 +24,7 @@ import adminRouter from './admin';
 import {financialRoutes} from './financeRoutes';
 import {commissionFor} from './finance';
 import {notifyBooking,sendOwnerPush,pushConfigured} from './notifications';
-import {startCardSubscription,cardSubscriptionStatus,cancelCardSubscription,reconcileCardInvoice,updateCardSubscriptionFromProvider} from './cardSubscriptions';
+import {startCardSubscription,cardSubscriptionStatus,cancelCardSubscription,reconcileCardInvoice,updateCardSubscriptionFromProvider,synchronizeCardMonthlyAmount} from './cardSubscriptions';
 import {MAX_MEDIA_BYTES,saveTenantMedia,findTenantMedia,mediaUrl,extractMediaId,deleteTenantMedia,type MediaKind} from './media';
 
 const app = express();
@@ -495,6 +495,71 @@ app.post('/api/billing/pix',auth,wrap(async(req,res)=>{
     invoice=await db.subscriptionPayment.update({where:{id:invoice.id},data:{mpPaymentId:String(payment.id),qrCode:tx.qr_code,qrCodeBase64:tx.qr_code_base64||'',ticketUrl:tx.ticket_url||''}});
   }
   res.json({invoiceId:invoice.id,amountCents:invoice.amountCents,qrCode:invoice.qrCode,qrCodeBase64:invoice.qrCodeBase64,ticketUrl:invoice.ticketUrl,expiresAt:invoice.expiresAt});
+}));
+
+/** O lojista paga somente os dias restantes para ativar uma vaga nova.
+ * Cobrança Pix pela conta da plataforma; jamais usa o Mercado Pago da cliente.
+ */
+app.get('/api/billing/addons',auth,wrap(async(req,res)=>{
+ const t=await myTenant(req),settings=await platformSettings();
+ const [pros,activeCount]=await Promise.all([
+   db.professional.findMany({where:{tenantId:t.id,billingPending:true},select:{id:true,name:true,role:true},orderBy:{name:'asc'}}),
+   db.professional.count({where:{tenantId:t.id,active:true}})
+ ]);
+ const now=new Date(),until=t.subscriptionEndsAt??now;
+ const proratedCents=proratedProfessionalCents(settings.additionalProfessionalCents,now,until,t.billingCycleStartedAt);
+ res.setHeader('Cache-Control','private,no-store');
+ res.json({pending:pros,proratedCents,subscriptionEndsAt:t.subscriptionEndsAt,
+  paidProfessionalSlots:Math.max(1,t.paidProfessionalSlots??activeCount),
+  additionalProfessionalCents:settings.additionalProfessionalCents});
+}));
+app.post('/api/billing/addons/:id/pix',auth,wrap(async(req,res)=>{
+ const t=await myTenant(req);
+ const body=z.object({
+   document:z.string().transform(x=>x.replace(/\D/g,'')).refine(x=>x.length===11||x.length===14,'Informe CPF ou CNPJ válido'),
+   deviceId:z.preprocess(v=>validDeviceId(v)?v:undefined,z.string().optional())
+ }).strict().parse(req.body);
+ if(t.suspendedAt||accessPeriod(t).status!=='ACTIVE'||!t.subscriptionEndsAt)
+   fail(409,'É necessário ter uma assinatura ativa para adicionar profissionais com cobrança proporcional.');
+ const [pro,user,settings,activeCount,card]=await Promise.all([
+   db.professional.findFirst({where:{id:String(req.params.id),tenantId:t.id,billingPending:true}}),
+   db.user.findUnique({where:{id:req.userId}}),
+   platformSettings(),db.professional.count({where:{tenantId:t.id,active:true}}),
+   db.cardSubscription.findUnique({where:{tenantId:t.id},select:{status:true}})
+ ]);
+ if(!pro)fail(404,'Profissional não encontrado ou já ativado.');
+ if(!user||!/^[0-9]{10,13}$/.test(user.phone||''))fail(428,'Informe WhatsApp no cadastro.');
+ if(card&&['CREATING','PENDING','PAUSED'].includes(card.status))
+   fail(409,'A assinatura de cartão ainda não está autorizada. Finalize ou cancele antes de pagar um adicional.');
+ const currentSlots=Math.max(1,t.paidProfessionalSlots??activeCount);
+ const now=new Date(),due=proratedProfessionalCents(settings.additionalProfessionalCents,now,t.subscriptionEndsAt,t.billingCycleStartedAt);
+ if(due===0){
+   await synchronizeCardMonthlyAmount(t.id,priceForSlots(settings,currentSlots+1).totalCents);
+   await db.$transaction(async tx=>{
+     const p=await tx.professional.updateMany({where:{id:pro.id,tenantId:t.id,billingPending:true},data:{billingPending:false,active:true}});
+     if(p.count)await tx.tenant.update({where:{id:t.id},data:{paidProfessionalSlots:currentSlots+1}});
+   });
+   res.json({activated:true,amountCents:0});return;
+ }
+ if(!env.VEZORA_MP_ACCESS_TOKEN||!env.VEZORA_MP_WEBHOOK_SECRET||!env.API_PUBLIC_URL)
+   fail(503,'Pagamento Pix ainda não configurado pelo administrador do Vezora.');
+ let invoice=await db.subscriptionPayment.findFirst({
+  where:{tenantId:t.id,professionalId:pro.id,kind:'ADDON',status:'PENDING',expiresAt:{gt:new Date(Date.now()+60_000)}},
+  orderBy:{createdAt:'desc'}
+ });
+ if(invoice&&(!invoice.mpPaymentId||!invoice.qrCode)&&invoice.expiresAt.getTime()-Date.now()<31*60000)invoice=null;
+ if(!invoice)invoice=await db.subscriptionPayment.create({
+   data:{tenantId:t.id,professionalId:pro.id,kind:'ADDON',amountCents:due,
+     cycleEndsAt:t.subscriptionEndsAt,expiresAt:new Date(Date.now()+45*60000)}
+ });
+ if(!invoice.mpPaymentId||!invoice.qrCode){
+   const payment=await generatePix(invoice.id,user.email,invoice.amountCents,body.document,invoice.expiresAt,user.name,validDeviceId(body.deviceId)?body.deviceId:undefined,'ADDON');
+   const tx=payment.point_of_interaction?.transaction_data;
+   if(!payment.id||!tx?.qr_code)fail(502,'Mercado Pago não retornou o Pix. Tente novamente.');
+   invoice=await db.subscriptionPayment.update({where:{id:invoice.id},data:{mpPaymentId:String(payment.id),qrCode:tx.qr_code,qrCodeBase64:tx.qr_code_base64||'',ticketUrl:tx.ticket_url||''}});
+ }
+ res.json({invoiceId:invoice.id,amountCents:invoice.amountCents,qrCode:invoice.qrCode,
+   qrCodeBase64:invoice.qrCodeBase64,ticketUrl:invoice.ticketUrl,expiresAt:invoice.expiresAt,kind:'ADDON'});
 }));
 app.post('/api/billing/check/:id',auth,wrap(async(req,res)=>{
   const t=await myTenant(req);
