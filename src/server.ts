@@ -585,7 +585,8 @@ app.post('/api/billing/card/start',auth,wrap(async(req,res)=>{
   if(!owner||!owner.phone)fail(428,'Informe WhatsApp no cadastro.');
   const s=await platformSettings();
   if(s.monthlyPriceCents<100)fail(503,'Defina a mensalidade no painel do administrador.');
-  const [activeCount,paidBase,pendingCount]=await Promise.all([db.professional.count({where:{tenantId:t.id,active:true}}),db.subscriptionPayment.findFirst({where:{tenantId:t.id,kind:'BASE',status:'PAID'},select:{id:true}})]);
+  const [activeCount,paidBase,pendingCount]=await Promise.all([db.professional.count({where:{tenantId:t.id,active:true}}),db.subscriptionPayment.findFirst({where:{tenantId:t.id,status:'PAID',OR:[{kind:'BASE'},{kind:{isSet:false}}]},select:{id:true}}),db.professional.count({where:{tenantId:t.id,billingPending:true}})]);
+  if(pendingCount>0)fail(409,'Conclua primeiro o pagamento dos profissionais adicionais pendentes.');
   if(!paidBase&&s.firstMonthPriceCents!==null&&s.firstMonthPriceCents!==s.monthlyPriceCents)
     fail(409,'O preço promocional do primeiro mês está disponível via Pix. Após esse pagamento você poderá usar o cartão recorrente.');
   const monthlyTotal=priceForSlots(s,Math.max(1,activeCount)).totalCents;
