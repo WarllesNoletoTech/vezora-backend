@@ -548,14 +548,22 @@ app.post('/api/billing/addons/:id/pix',auth,wrap(async(req,res)=>{
  }
  if(!env.VEZORA_MP_ACCESS_TOKEN||!env.VEZORA_MP_WEBHOOK_SECRET||!env.API_PUBLIC_URL)
    fail(503,'Pagamento Pix ainda não configurado pelo administrador do Vezora.');
- let invoice=await db.subscriptionPayment.findFirst({
-  where:{tenantId:t.id,professionalId:pro.id,kind:'ADDON',status:'PENDING',expiresAt:{gt:new Date(Date.now()+60_000)}},
-  orderBy:{createdAt:'desc'}
- });
- if(invoice&&(!invoice.mpPaymentId||!invoice.qrCode)&&invoice.expiresAt.getTime()-Date.now()<31*60000)invoice=null;
- if(!invoice)invoice=await db.subscriptionPayment.create({
-   data:{tenantId:t.id,professionalId:pro.id,kind:'ADDON',amountCents:due,
-     cycleEndsAt:t.subscriptionEndsAt,expiresAt:new Date(Date.now()+45*60000)}
+ // Uma cobrança adicional por vez impede sincronização simultânea de valores recorrentes.
+ let invoice=await db.$transaction(async tx=>{
+   // Conflito de escrita em billingRevision serializa duas tentativas concorrentes.
+   await tx.tenant.update({where:{id:t.id},data:{billingRevision:{increment:1}}});
+   const pending=await tx.subscriptionPayment.findFirst({
+     where:{tenantId:t.id,kind:'ADDON',status:'PENDING',expiresAt:{gt:new Date()}},
+     orderBy:{createdAt:'desc'}
+   });
+   if(pending){
+     if(pending.professionalId!==pro.id)fail(409,'Há outro adicional aguardando Pix. Conclua ou aguarde o vencimento antes de pagar o próximo.');
+     return pending;
+   }
+   return tx.subscriptionPayment.create({
+     data:{tenantId:t.id,professionalId:pro.id,kind:'ADDON',amountCents:due,
+       cycleEndsAt:t.subscriptionEndsAt!,expiresAt:new Date(Date.now()+45*60000)}
+   });
  });
  if(!invoice.mpPaymentId||!invoice.qrCode){
    const payment=await generatePix(invoice.id,user.email,invoice.amountCents,body.document,invoice.expiresAt,user.name,validDeviceId(body.deviceId)?body.deviceId:undefined,'ADDON');
