@@ -40,22 +40,22 @@ router.get('/summary',run(async(_req,res)=>{
   for(const t of tenants.filter(t=>!t.archivedAt)){const st=accessPeriod(t).status;statusCounts[st]=(statusCounts[st]||0)+1;types[t.businessType||'PENDENTE']=(types[t.businessType||'PENDENTE']||0)+1;}
   res.json({totalTenants:tenants.filter(t=>!t.archivedAt).length,totalOwners:owners-admins,totalBookings:bookings,newTenants30:tenants.filter(t=>!t.archivedAt&&t.createdAt>=new Date(Date.now()-30*86400000)).length,
     statusCounts,types,receivedTotalCents:receipts._sum.amountCents||0,received30Cents:received30._sum.amountCents||0,paidPaymentCount:receipts._count._all,
-    latestPayments:latest,monthlyPriceCents:setting.monthlyPriceCents,trialDays:setting.trialDays});
+    latestPayments:latest,monthlyPriceCents:setting.monthlyPriceCents,firstMonthPriceCents:setting.firstMonthPriceCents,additionalProfessionalCents:setting.additionalProfessionalCents,trialDays:setting.trialDays});
 }));
 router.get('/settings',run(async(_req,res)=>{
   const s=await platformSettings();
-  res.json({monthlyPriceCents:s.monthlyPriceCents,trialDays:s.trialDays,updatedAt:s.updatedAt,pixConfigured:Boolean(s.monthlyPriceCents>=100&&env.VEZORA_MP_ACCESS_TOKEN&&env.VEZORA_MP_WEBHOOK_SECRET&&env.API_PUBLIC_URL),
+  res.json({monthlyPriceCents:s.monthlyPriceCents,firstMonthPriceCents:s.firstMonthPriceCents,additionalProfessionalCents:s.additionalProfessionalCents,trialDays:s.trialDays,updatedAt:s.updatedAt,pixConfigured:Boolean(s.monthlyPriceCents>=100&&env.VEZORA_MP_ACCESS_TOKEN&&env.VEZORA_MP_WEBHOOK_SECRET&&env.API_PUBLIC_URL),
     paymentIntegrationConfigured:Boolean(env.VEZORA_MP_ACCESS_TOKEN&&env.VEZORA_MP_WEBHOOK_SECRET&&env.API_PUBLIC_URL)});
 }));
 router.patch('/settings',run(async(req,res)=>{
-  const body=z.object({monthlyPriceCents:z.number().int().refine(v=>v===0||(v>=100&&v<=500000),'Informe zero ou valor entre R$ 1,00 e R$ 5.000,00').optional(),trialDays:z.number().int().min(0).max(90).optional()}).strict().refine(v=>v.monthlyPriceCents!==undefined||v.trialDays!==undefined,'Informe uma configuração').parse(req.body);
+  const body=z.object({monthlyPriceCents:z.number().int().refine(v=>v===0||(v>=100&&v<=500000),'Informe zero ou valor entre R$ 1,00 e R$ 5.000,00').optional(),firstMonthPriceCents:z.number().int().min(100).max(500000).nullable().optional(),additionalProfessionalCents:z.number().int().min(0).max(500000).optional(),trialDays:z.number().int().min(0).max(90).optional()}).strict().refine(v=>Object.keys(v).length>0,'Informe uma configuração').parse(req.body);
   const before=await platformSettings();
   const saved=await db.$transaction(async tx=>{
-    const updated=await tx.platformSettings.update({where:{id:'global'},data:{...(body.monthlyPriceCents!==undefined?{monthlyPriceCents:body.monthlyPriceCents}:{}),...(body.trialDays!==undefined?{trialDays:body.trialDays}:{})}});
-    await tx.adminAuditLog.create({data:{actorId:req.userId!,action:'UPDATE_BILLING_SETTINGS',details:`preço: ${before.monthlyPriceCents} -> ${updated.monthlyPriceCents} centavos; teste: ${before.trialDays} -> ${updated.trialDays} dias`}});
+    const updated=await tx.platformSettings.update({where:{id:'global'},data:{...(body.monthlyPriceCents!==undefined?{monthlyPriceCents:body.monthlyPriceCents}:{}),...(body.firstMonthPriceCents!==undefined?{firstMonthPriceCents:body.firstMonthPriceCents}:{}),...(body.additionalProfessionalCents!==undefined?{additionalProfessionalCents:body.additionalProfessionalCents}:{}),...(body.trialDays!==undefined?{trialDays:body.trialDays}:{})}});
+    await tx.adminAuditLog.create({data:{actorId:req.userId!,action:'UPDATE_BILLING_SETTINGS',details:`preço: ${before.monthlyPriceCents} -> ${updated.monthlyPriceCents} centavos; primeiro mês: ${before.firstMonthPriceCents} -> ${updated.firstMonthPriceCents}; profissional: ${before.additionalProfessionalCents} -> ${updated.additionalProfessionalCents}; teste: ${before.trialDays} -> ${updated.trialDays} dias`}});
     return updated;
   });
-  res.json({monthlyPriceCents:saved.monthlyPriceCents,trialDays:saved.trialDays,updatedAt:saved.updatedAt});
+  res.json({monthlyPriceCents:saved.monthlyPriceCents,firstMonthPriceCents:saved.firstMonthPriceCents,additionalProfessionalCents:saved.additionalProfessionalCents,trialDays:saved.trialDays,updatedAt:saved.updatedAt});
 }));
 
 /** Exporta dados operacionais (ate 5.000 linhas) exclusivamente para SUPERADMIN. */
