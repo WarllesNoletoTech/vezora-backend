@@ -458,7 +458,7 @@ app.get('/api/billing/status',auth,wrap(async(req,res)=>{
     firstMonthPriceCents:firstPrice.totalCents,renewalPriceCents:renewal.totalCents,
     nextPaymentCents:intro?firstPrice.totalCents:renewal.totalCents,isFirstMonth:intro,
     additionalProfessionalCents:settings.additionalProfessionalCents,includedProfessionals:1,
-    professionalCount:activeCount,pendingProfessionalCount:pendingCount,paidProfessionalSlots:Math.max(1,t.paidProfessionalSlots??activeCount)});
+    professionalCount:activeCount,pendingProfessionalCount:pendingCount,paidProfessionalSlots:Math.max(1,t.paidProfessionalSlots??activeCount,activeCount)});
 
 }));
 app.post('/api/billing/pix',auth,wrap(async(req,res)=>{
@@ -515,7 +515,7 @@ app.get('/api/billing/addons',auth,wrap(async(req,res)=>{
  const proratedCents=proratedProfessionalCents(settings.additionalProfessionalCents,now,until,t.billingCycleStartedAt);
  res.setHeader('Cache-Control','private,no-store');
  res.json({pending:pros,proratedCents,subscriptionEndsAt:t.subscriptionEndsAt,
-  paidProfessionalSlots:Math.max(1,t.paidProfessionalSlots??activeCount),
+  paidProfessionalSlots:Math.max(1,t.paidProfessionalSlots??activeCount,activeCount),
   additionalProfessionalCents:settings.additionalProfessionalCents});
 }));
 app.post('/api/billing/addons/:id/pix',auth,wrap(async(req,res)=>{
@@ -536,9 +536,10 @@ app.post('/api/billing/addons/:id/pix',auth,wrap(async(req,res)=>{
  if(!user||!/^[0-9]{10,13}$/.test(user.phone||''))fail(428,'Informe WhatsApp no cadastro.');
  if(card&&['CREATING','PENDING','PAUSED'].includes(card.status))
    fail(409,'A assinatura de cartão ainda não está autorizada. Finalize ou cancele antes de pagar um adicional.');
- const currentSlots=Math.max(1,t.paidProfessionalSlots??activeCount);
+ const currentSlots=Math.max(1,t.paidProfessionalSlots??activeCount,activeCount);
  const now=new Date(),due=proratedProfessionalCents(settings.additionalProfessionalCents,now,t.subscriptionEndsAt,t.billingCycleStartedAt);
  if(due===0){
+   if(card?.status==='AUTHORIZED')fail(409,'O adicional proporcional ficou abaixo de R$ 1,00. Para evitar alterar a recorrência sem cobrança, aguarde a próxima renovação para ativar esta vaga.');
    await synchronizeCardMonthlyAmount(t.id,priceForSlots(settings,currentSlots+1).totalCents);
    await db.$transaction(async tx=>{
      const p=await tx.professional.updateMany({where:{id:pro.id,tenantId:t.id,billingPending:true},data:{billingPending:false,active:true}});
