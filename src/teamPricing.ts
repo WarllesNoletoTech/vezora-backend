@@ -11,7 +11,7 @@ export function priceForSlots(pricing:Pricing,slots:number,firstMonth=false) {
   if(!Number.isSafeInteger(base+extras)||base<0||extras<0)throw new Error('Preço de assinatura inválido');
   return {baseCents:base,additionalCents:extras,totalCents:base+extras,slots};
 }
-/** Resto de ciclo de até 30 dias; 1º minuto pago proporcionalmente, arredondado ao centavo.
+/** Dias restantes em ciclos Pix (30 dias) ou cartão (margem de até 32 dias), arredondado ao centavo.
  * Se o valor ficar abaixo de R$1 (mínimo operacional do Pix), oferece o restante
  * do período sem cobrança adicional e passa a contar o profissional na renovação.
  */
