@@ -85,7 +85,7 @@ export async function reconcileSubscription(paymentId:string) {
     if(!invoice.professionalId||!invoice.cycleEndsAt)return false;
     const tenant=await db.tenant.findUnique({where:{id:invoice.tenantId}});
     if(!tenant||tenant.archivedAt)return false;
-    const active=await db.professional.count({where:{tenantId:tenant.id,active:true,billingPending:false}});
+    const active=await db.professional.count({where:{tenantId:tenant.id,active:true}});
     const currentSlots=Math.max(1,tenant.paidProfessionalSlots??active);
     const settings=await platformSettings();
     const monthly=priceForSlots(settings,currentSlots+1).totalCents;
@@ -100,23 +100,23 @@ export async function reconcileSubscription(paymentId:string) {
     if(!tenant)return false;
     if(invoice.kind==='ADDON') {
       if(!invoice.professionalId)return false;
-      const active=await tx.professional.count({where:{tenantId:tenant.id,active:true,billingPending:false}});
+      const active=await tx.professional.count({where:{tenantId:tenant.id,active:true}});
       const slots=Math.max(1,tenant.paidProfessionalSlots??active)+1;
       await tx.tenant.update({where:{id:tenant.id},data:{paidProfessionalSlots:slots}});
-      await tx.professional.updateMany({where:{id:invoice.professionalId,tenantId:tenant.id,billingPending:true},data:{active:true,billingPending:false}});
+      await tx.professional.updateMany({where:{id:invoice.professionalId,tenantId:tenant.id,billingPending:true},data:{active:true}});
       // Um adicional nao estende o vencimento da assinatura.
       return true;
     }
     const base=tenant.subscriptionEndsAt && tenant.subscriptionEndsAt>providerPaidAt?tenant.subscriptionEndsAt:providerPaidAt;
     const nextEnd=new Date(base.getTime()+BILLING_DAYS*86400000);
-    const active=await tx.professional.count({where:{tenantId:tenant.id,active:true,billingPending:false}});
+    const active=await tx.professional.count({where:{tenantId:tenant.id,active:true}});
     const slots=Math.max(1,active,invoice.billedSlots??1);
     await tx.tenant.update({where:{id:tenant.id},data:{subscriptionEndsAt:nextEnd,billingCycleStartedAt:base,paidProfessionalSlots:slots}});
     // O preco foi congelado na emissao do Pix. So liberar vagas previstas no valor pago.
     const openSlots=Math.max(0,slots-active);
     if(openSlots){
       const pendingPros=await tx.professional.findMany({where:{tenantId:tenant.id,billingPending:true},take:openSlots,orderBy:{name:'asc'},select:{id:true}});
-      for(const p of pendingPros)await tx.professional.update({where:{id:p.id},data:{active:true,billingPending:false}});
+      for(const p of pendingPros)await tx.professional.update({where:{id:p.id},data:{active:true}});
     }
     return true;
   });
