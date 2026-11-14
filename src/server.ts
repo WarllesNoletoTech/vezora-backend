@@ -446,7 +446,7 @@ app.get('/api/billing/status',auth,wrap(async(req,res)=>{
     platformSettings(),
     db.professional.count({where:{tenantId:t.id,active:true}}),
     db.professional.count({where:{tenantId:t.id,billingPending:true}}),
-    db.subscriptionPayment.findFirst({where:{tenantId:t.id,status:'PAID',kind:'BASE'},select:{id:true}})
+    db.subscriptionPayment.findFirst({where:{tenantId:t.id,status:'PAID',OR:[{kind:'BASE'},{kind:{isSet:false}}]},select:{id:true}})
   ]);
   const slots=Math.max(1,activeCount+pendingCount);
   const intro=!paidBase,firstPrice=priceForSlots(settings,slots,true),renewal=priceForSlots(settings,slots,false);
@@ -467,10 +467,11 @@ app.post('/api/billing/pix',auth,wrap(async(req,res)=>{
   const settings=await platformSettings();
   if(!env.VEZORA_MP_ACCESS_TOKEN||!env.VEZORA_MP_WEBHOOK_SECRET||!env.API_PUBLIC_URL||settings.monthlyPriceCents<100) fail(503,'Pagamento Pix ou mensalidade ainda não configurados pelo administrador do Vezora');
   const [paidBase,activeCount,pendingCount]=await Promise.all([
-    db.subscriptionPayment.findFirst({where:{tenantId:tenant.id,kind:'BASE',status:'PAID'},select:{id:true}}),
+    db.subscriptionPayment.findFirst({where:{tenantId:tenant.id,status:'PAID',OR:[{kind:'BASE'},{kind:{isSet:false}}]},select:{id:true}}),
     db.professional.count({where:{tenantId:tenant.id,active:true}}),
     db.professional.count({where:{tenantId:tenant.id,billingPending:true}})
   ]);
+  if(pendingCount>0&&accessPeriod(tenant).status==='ACTIVE')fail(409,'Conclua primeiro o pagamento dos profissionais adicionais pendentes.');
   const slots=Math.max(1,activeCount+pendingCount);
   const price=priceForSlots(settings,slots,!paidBase).totalCents;
   if(price<100)fail(503,'Preço do plano inválido para Pix. Corrija as configurações comerciais.');
@@ -584,7 +585,7 @@ app.post('/api/billing/card/start',auth,wrap(async(req,res)=>{
   if(!owner||!owner.phone)fail(428,'Informe WhatsApp no cadastro.');
   const s=await platformSettings();
   if(s.monthlyPriceCents<100)fail(503,'Defina a mensalidade no painel do administrador.');
-  const [activeCount,paidBase]=await Promise.all([db.professional.count({where:{tenantId:t.id,active:true}}),db.subscriptionPayment.findFirst({where:{tenantId:t.id,kind:'BASE',status:'PAID'},select:{id:true}})]);
+  const [activeCount,paidBase,pendingCount]=await Promise.all([db.professional.count({where:{tenantId:t.id,active:true}}),db.subscriptionPayment.findFirst({where:{tenantId:t.id,kind:'BASE',status:'PAID'},select:{id:true}})]);
   if(!paidBase&&s.firstMonthPriceCents!==null&&s.firstMonthPriceCents!==s.monthlyPriceCents)
     fail(409,'O preço promocional do primeiro mês está disponível via Pix. Após esse pagamento você poderá usar o cartão recorrente.');
   const monthlyTotal=priceForSlots(s,Math.max(1,activeCount)).totalCents;
