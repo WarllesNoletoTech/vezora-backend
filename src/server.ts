@@ -593,6 +593,8 @@ app.post('/api/billing/card/start',auth,wrap(async(req,res)=>{
   const t=await myTenant(req);
   if(t.suspendedAt)fail(403,'Estabelecimento suspenso.');
   if(!t.businessType)fail(428,'Complete o cadastro antes de assinar.');
+  if(t.subscriptionEndsAt&&t.subscriptionEndsAt.getTime()>Date.now()+3*86400000)
+    fail(409,'Sua assinatura já está paga. Para evitar uma nova cobrança antecipada, ative o cartão quando faltarem até 3 dias para o vencimento.');
   const owner=await db.user.findUnique({where:{id:req.userId},select:{email:true,phone:true}});
   if(!owner||!owner.phone)fail(428,'Informe WhatsApp no cadastro.');
   const s=await platformSettings();
